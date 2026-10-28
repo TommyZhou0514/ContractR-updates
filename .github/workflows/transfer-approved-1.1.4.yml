@@ -1,0 +1,93 @@
+name: Transfer approved ContractR 1.1.4 assets
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: approved-contractr-1.1.4-assets
+  cancel-in-progress: false
+jobs:
+  transfer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      APPROVED_ARTIFACT_URL: ${{ secrets.APPROVED_CI_ARTIFACT_URL_114 }}
+    steps:
+      - name: Verify original CI artifact and upload draft assets only
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib,shutil,subprocess,sys,tempfile,urllib.request,zipfile
+          REPO='TommyZhou0514/ContractR-updates'
+          TAG='v1.1.4'
+          COMMIT='274153ac0508f84bdb20e05fd1b4732c01e1089f'
+          ARCHIVE_SHA='27362691d6e6ab82935fe1996c386485143ee4b1653b895dc04483bc4878d261'
+          EXPECTED={'ContractR-Demo-Setup-1.1.4-x64.exe': {'sha256': '81a8587cb1bafdfe738750ee36a770af104d947193cca76f4039da98595849d2', 'size': 237572786}, 'ContractR-Windows-Upgrade-1.1.4-from-1.0.0.zip': {'sha256': '8fa6613ccffd4c3ef5b92fbbec7075ab32dd404ad633d0e87b5ddbeaa3c7895a', 'size': 237579116}, 'windows-x64.json': {'sha256': '22ced48aba6e4d55c2a0f8124c70e83b7d04c3041ec14732e60e72b6c76ab65c', 'size': 2986}, 'SHA256SUMS.txt': {'sha256': 'd20256b385163c87ba7fc20d74e98b9eee7d037274d101fa211cf5af41a46ba3', 'size': 297}}
+          def sha(file):
+           h=hashlib.sha256()
+           with open(file,'rb') as f:
+            for b in iter(lambda:f.read(1024*1024),b''):h.update(b)
+           return h.hexdigest()
+          def gh(args):return subprocess.check_output(['gh',*args],text=True)
+          def draft():
+           r=json.loads(gh(['release','view',TAG,'--repo',REPO,'--json','isDraft,assets']))
+           assert r['isDraft'],'Release must remain an unpublished draft'
+           assert all(a['name'] in EXPECTED for a in r['assets']),'Unexpected draft asset'
+           return r
+          def verify(root,archive):
+           assert archive.stat().st_size==474318296 and sha(archive)==ARCHIVE_SHA,'Original CI artifact mismatch'
+           names=['ContractR-Demo-Setup-1.1.4-x64.exe','ContractR-Windows-Upgrade-1.1.4-from-1.0.0.zip','build-info.json']
+           with zipfile.ZipFile(archive) as z:
+            assert sorted(z.namelist())==sorted(names) and len(z.namelist())==3
+            for name in names:
+             with z.open(name) as src,open(root/name,'wb') as dst:shutil.copyfileobj(src,dst)
+           info=json.loads((root/'build-info.json').read_text())
+           assert (info['commit'],info['version'],info['platform'],info['arch'])==(COMMIT,'1.1.4','win32','x64')
+           for name,expected in EXPECTED.items():
+            f=root/name
+            assert f.stat().st_size==expected['size'] and sha(f)==expected['sha256'],name+' mismatch'
+           with zipfile.ZipFile(root/names[1]) as z:
+            assert sorted(z.namelist())==sorted([names[0],'Upgrade-ContractR.cmd','使用说明.txt']) and len(z.namelist())==3
+            h=hashlib.sha256()
+            with z.open(names[0]) as f:
+             for b in iter(lambda:f.read(1024*1024),b''):h.update(b)
+            assert h.hexdigest()==EXPECTED[names[0]]['sha256']
+           sums=dict(line.split('  ',1)[::-1] for line in (root/'SHA256SUMS.txt').read_text().splitlines())
+           assert sums=={name:v['sha256'] for name,v in EXPECTED.items() if name!='SHA256SUMS.txt'}
+           return info
+          def main():
+           assert os.environ['GITHUB_REPOSITORY']==REPO
+           draft()
+           with tempfile.TemporaryDirectory(prefix='contractr-approved-ci-') as temp:
+            root=pathlib.Path(temp);archive=root/'approved-ci.zip'
+            url=os.environ['APPROVED_ARTIFACT_URL']
+            assert url.startswith('https://'),'HTTPS artifact URL required'
+            h=hashlib.sha256();count=0
+            with urllib.request.urlopen(url,timeout=120) as response,open(archive,'wb') as dst:
+             while True:
+              b=response.read(1024*1024)
+              if not b:break
+              count+=len(b);assert count<=474318296
+              h.update(b);dst.write(b)
+            assert count==474318296 and h.hexdigest()==ARCHIVE_SHA
+            subprocess.run(['gh','release','download',TAG,'--repo',REPO,'--pattern','windows-x64.json','--pattern','SHA256SUMS.txt','--dir',str(root)],check=True)
+            verify(root,archive)
+            proof=[]
+            for name,expected in EXPECTED.items():
+             r=draft();existing=[a for a in r['assets'] if a['name']==name]
+             same=lambda a:a['state']=='uploaded' and a['size']==expected['size'] and a['digest']=='sha256:'+expected['sha256']
+             if not existing or not same(existing[0]):
+              subprocess.run(['gh','release','upload',TAG,'--repo',REPO,'--clobber',str(root/name)],check=True)
+             assets=[a for a in draft()['assets'] if a['name']==name]
+             assert len(assets)==1 and same(assets[0])
+             proof.append({'name':name,**expected,'verified':True})
+            assert len(draft()['assets'])==4
+            print(json.dumps({'ciRun':40621398848,'commit':COMMIT,'originalArtifactSha256':ARCHIVE_SHA,'draftOnly':True,'assets':proof}))
+            # Publishing is deliberately left to the original reviewed local publisher.
+          if __name__=='__main__':
+           try:main()
+           except Exception as error:
+            print(type(error).__name__+': approved artifact transfer did not complete',file=sys.stderr)
+            sys.exit(1)
+          PY
