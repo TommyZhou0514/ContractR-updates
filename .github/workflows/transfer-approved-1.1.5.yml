@@ -1,0 +1,96 @@
+name: Transfer approved ContractR 1.1.5 assets
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: approved-contractr-1.1.5-assets
+  cancel-in-progress: false
+jobs:
+  transfer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      APPROVED_ASSET_URLS: ${{ secrets.APPROVED_CI_ASSET_URLS_115 }}
+    steps:
+      - name: Verify reviewed CI build and upload draft assets only
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import base64,hashlib,json,os,pathlib,subprocess,sys,tempfile,urllib.request,zipfile
+          REPO='TommyZhou0514/ContractR-updates'
+          TAG='v1.1.5'
+          COMMIT='6dfef73962360b153340c1ed5c7eca2de3373c97'
+          EXE='ContractR-Demo-Setup-1.1.5-x64.exe'
+          ZIP='ContractR-Windows-Upgrade-1.1.5-from-1.0.0.zip'
+          INFO={'sha256':'2c260e4f4346ef3475858784a234939aec07de4ea9eb59abdd0a0fd95f7cad1d','size':1212}
+          EXPECTED={EXE:{'sha256':'86d771484ddf4b480228763de7231137820ca0c499ac290959492f45eb4f2867','size':237957734},ZIP:{'sha256':'920f64999d137b570fd64703768b77a99f4b4267f63942e9f915e04484b82efb','size':237964064},'windows-x64.json':{'sha256':'5943f924d4cef1dda6766ee325b4f760e6954f6d4f905a43365c9b5f00731d85','size':5854},'SHA256SUMS.txt':{'sha256':'5157a95f78142b5c826ba56efc3ef229833c7d902c06219318023d80855d6df9','size':297}}
+          def sha(file):
+           h=hashlib.sha256()
+           with open(file,'rb') as f:
+            for b in iter(lambda:f.read(1024*1024),b''):h.update(b)
+           return h.hexdigest()
+          def gh(args):return subprocess.check_output(['gh',*args],text=True)
+          def draft():
+           r=json.loads(gh(['release','view',TAG,'--repo',REPO,'--json','isDraft,assets']))
+           assert r['isDraft'],'Release must remain an unpublished draft'
+           assert all(a['name'] in EXPECTED for a in r['assets']),'Unexpected draft asset'
+           return r
+          def fetch(url,dst,expected):
+           assert url.startswith('https://'),'HTTPS asset URL required'
+           h=hashlib.sha256();count=0
+           with urllib.request.urlopen(url,timeout=120) as response,open(dst,'wb') as out:
+            while True:
+             b=response.read(1024*1024)
+             if not b:break
+             count+=len(b);assert count<=expected['size'],dst.name+' too large'
+             h.update(b);out.write(b)
+           assert count==expected['size'] and h.hexdigest()==expected['sha256'],dst.name+' mismatch'
+          def main():
+           assert os.environ['GITHUB_REPOSITORY']==REPO
+           draft()
+           urls=json.loads(os.environ['APPROVED_ASSET_URLS'])
+           with tempfile.TemporaryDirectory(prefix='contractr-approved-ci-') as temp:
+            root=pathlib.Path(temp)
+            fetch(urls['info'],root/'build-info.json',INFO)
+            info=json.loads((root/'build-info.json').read_text())
+            assert (info['commit'],info['version'],info['platform'],info['arch'])==(COMMIT,'1.1.5','win32','x64')
+            assert (info['installer'],info['sha256'],info['size'])==(EXE,EXPECTED[EXE]['sha256'],EXPECTED[EXE]['size'])
+            assert (info['upgrade'],info['upgradeSha256'],info['upgradeSize'])==(ZIP,EXPECTED[ZIP]['sha256'],EXPECTED[ZIP]['size'])
+            fetch(urls['exe'],root/EXE,EXPECTED[EXE])
+            fetch(urls['zip'],root/ZIP,EXPECTED[ZIP])
+            assert (root/EXE).read_bytes()[:2]==b'MZ'
+            with zipfile.ZipFile(root/ZIP) as z:
+             names=z.namelist()
+             assert len(names)==3 and EXE in names and 'Upgrade-ContractR.cmd' in names
+             h=hashlib.sha256()
+             with z.open(EXE) as f:
+              for b in iter(lambda:f.read(1024*1024),b''):h.update(b)
+             assert h.hexdigest()==EXPECTED[EXE]['sha256'],'EXE inside ZIP mismatch'
+            subprocess.run(['gh','release','download',TAG,'--repo',REPO,'--pattern','windows-x64.json','--pattern','SHA256SUMS.txt','--dir',str(root)],check=True)
+            for name in ('windows-x64.json','SHA256SUMS.txt'):
+             assert (root/name).stat().st_size==EXPECTED[name]['size'] and sha(root/name)==EXPECTED[name]['sha256'],name+' mismatch'
+            sums=dict(line.split('  ',1)[::-1] for line in (root/'SHA256SUMS.txt').read_text().splitlines())
+            assert sums=={name:v['sha256'] for name,v in EXPECTED.items() if name!='SHA256SUMS.txt'}
+            payload=json.loads(base64.b64decode(json.loads((root/'windows-x64.json').read_text())['payload']))
+            assert payload['version']=='1.1.5' and payload['artifact']['sha256']==EXPECTED[EXE]['sha256'] and payload['artifact']['size']==EXPECTED[EXE]['size']
+            proof=[]
+            for name,expected in EXPECTED.items():
+             r=draft();existing=[a for a in r['assets'] if a['name']==name]
+             same=lambda a:a['state']=='uploaded' and a['size']==expected['size'] and a['digest']=='sha256:'+expected['sha256']
+             if not existing or not same(existing[0]):
+              assert name in (EXE,ZIP),name+' must already be in the draft'
+              subprocess.run(['gh','release','upload',TAG,'--repo',REPO,'--clobber',str(root/name)],check=True)
+             assets=[a for a in draft()['assets'] if a['name']==name]
+             assert len(assets)==1 and same(assets[0])
+             proof.append({'name':name,**expected,'verified':True})
+            assert len(draft()['assets'])==4
+            print(json.dumps({'commit':COMMIT,'buildInfoSha256':INFO['sha256'],'draftOnly':True,'assets':proof}))
+            # Publishing is deliberately left to the original reviewed local publisher.
+          if __name__=='__main__':
+           try:main()
+           except Exception as error:
+            print(type(error).__name__+': approved asset transfer did not complete: '+str(error)[:200],file=sys.stderr)
+            sys.exit(1)
+          PY
